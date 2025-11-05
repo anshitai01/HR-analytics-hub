@@ -1,0 +1,15 @@
+# requirements.txt
+fastapi
+uvicorn[standard]
+pandas
+openpyxl
+python-dotenv
+google-generativeai
+pydantic-settings
+streamlit
+matplotlib
+plotly 
+scikit-learn  # For ML models like LDA
+nltk          # For NLP text pre-processing
+vaderSentiment
+xlrd       

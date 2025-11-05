@@ -1,0 +1,1928 @@
+--- Project: components ---
+--- Root Path: K:/Anshit/HR/components ---
+--- Generated on: 2025-11-05 16:51:48 ---
+
+--- Project Structure ---
+components/
+└── __init__.py
+└── attendance/
+    └── __init__.py
+    └── analyzer.py
+    └── app/
+        └── review_app.py
+    └── exporter.py
+    └── insights.py
+    └── logic.py
+    └── router.py
+    └── schemas.py
+└── core/
+    └── __init__.py
+    └── ai_services.py
+    └── config.py
+└── download_nltk_data.py
+└── exit_analysis/
+    └── __init__.py
+    └── analyzer.py
+    └── app/
+        └── exit_app.py
+    └── logic.py
+    └── router.py
+    └── schemas.py
+└── main.py
+└── requirements.txt
+
+
+--- File Contents ---
+
+--- File: __init__.py ---
+
+--- END ---
+
+--- File: download_nltk_data.py ---
+# download_nltk_data.py
+import nltk
+import os
+
+# Define a local directory to store the NLTK data
+DOWNLOAD_DIR = os.path.join(os.getcwd(), 'nltk_data')
+if not os.path.exists(DOWNLOAD_DIR):
+    os.makedirs(DOWNLOAD_DIR)
+
+print(f"Starting NLTK data download into local folder: {DOWNLOAD_DIR}")
+
+# The 'punkt' tokenizer model for splitting text into sentences/words
+nltk.download('punkt', download_dir=DOWNLOAD_DIR)
+
+# A list of common 'stopwords' (e.g., 'the', 'a', 'is') to ignore
+nltk.download('stopwords', download_dir=DOWNLOAD_DIR)
+
+# The 'wordnet' model for lemmatization (reducing words to their base form)
+nltk.download('wordnet', download_dir=DOWNLOAD_DIR)
+
+print("\nAll required NLTK data packages have been downloaded locally.")
+print("You can now run the Streamlit application.")
+--- END ---
+
+--- File: main.py ---
+# main.py
+# Located inside your COMPONENTS folder
+
+from fastapi import FastAPI
+# Corrected imports for your structure
+from attendance import router as attendance_router
+
+from exit_analysis import router as exit_router
+
+app = FastAPI(
+    title="HR AI Suite",
+    version="1.0.0"
+)
+
+# Include the router from our attendance component
+app.include_router(attendance_router.router)
+
+app.include_router(exit_router.router)
+
+@app.get("/", tags=["Health Check"])
+def read_root():
+    # This is the expected welcome message for our project
+    return {"status": "HR AI Suite is running"}
+--- END ---
+
+--- File: requirements.txt ---
+# requirements.txt
+fastapi
+uvicorn[standard]
+pandas
+openpyxl
+python-dotenv
+google-generativeai
+pydantic-settings
+streamlit
+matplotlib
+plotly 
+scikit-learn  # For ML models like LDA
+nltk          # For NLP text pre-processing
+vaderSentiment
+xlrd
+--- END ---
+
+--- File: attendance/__init__.py ---
+
+--- END ---
+
+--- File: attendance/analyzer.py ---
+# components/attendance/analyzer.py
+
+import pandas as pd
+import numpy as np
+import re
+import logging
+
+# --- Setup logging ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+# --- Constants for clarity and maintainability ---
+# W* and H* are now officially classified as Presence codes per HR confirmation.
+PRESENCE_CODES = {'P', 'AR', 'W*', 'H*'}
+LEAVE_CODES = {'BL', 'CL', 'CO', 'EL', 'ELec', 'ML', 'PL', 'PRL', 'RH', 'SL'}
+ABSENCE_CODES = {'LWP', 'ABSENT'}
+
+# Codes that we want to break down for detailed analysis
+LEAVE_BREAKDOWN_CODES = {'CL', 'SL', 'PRL', 'BL', 'ML', 'RH', 'ELec', 'CO'}
+
+# --- Main Analysis Pipeline ---
+
+def analyze_attendance(file_contents: bytes) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Main orchestration function. Reads, cleans, processes, and aggregates the attendance data.
+    
+    Returns a tuple:
+    1. The final employee-aggregated DataFrame.
+    2. The intermediate daily metrics DataFrame, needed for time-series analysis.
+    """
+    logger.info("Starting full attendance analysis pipeline...")
+    
+    try:
+        raw_df = pd.read_excel(file_contents, sheet_name=0)
+    except Exception as e:
+        logger.error(f"Failed to read Excel file. Error: {e}")
+        return pd.DataFrame(), pd.DataFrame()
+
+    long_df = _clean_and_melt_data(raw_df)
+    if long_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    metrics_df = _calculate_metrics_from_long_data(long_df)
+
+    aggregated_df = _aggregate_employee_data(metrics_df)
+    
+    logger.info(f"Analysis complete. Processed {len(aggregated_df)} unique employees.")
+    
+    return aggregated_df, metrics_df
+
+# --- Helper Functions ---
+
+def _clean_and_melt_data(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Cleans, filters, and transforms raw data from wide to long format.
+    Includes robust logic for column name matching and duplicate employee handling.
+    """
+    logger.info("Step 1: Cleaning and melting data...")
+
+    # --- THE DEFINITIVE FIX: Robust Column Name Normalization ---
+
+    # 1. Define the canonical (ideal) column names our application will use internally.
+    #    *** MODIFICATION 1: Added 'Relieving_Date' to the canonical set. ***
+    CANONICAL_METADATA_COLS = {
+        'Employee ID', 'Employee Name', 'Reporting_Manager', 
+        'Email ID', 'OU Name', 'Functional Lead', 'Relieving_Date'
+    }
+
+    # 2. Create a helper function to 'normalize' any given column name for matching.
+    #    (lowercase, strip whitespace, replace underscores and multiple spaces)
+    def normalize_col(name):
+        return re.sub(r'\s+', ' ', str(name).strip().lower().replace('_', ' '))
+
+    # 3. Build a mapping from the actual, messy column names in the file
+    #    to our clean, canonical names.
+    rename_map = {}
+    normalized_target_map = {normalize_col(name): name for name in CANONICAL_METADATA_COLS}
+
+    for col in df.columns:
+        normalized_col = normalize_col(col)
+        if normalized_col in normalized_target_map:
+            canonical_name = normalized_target_map[normalized_col]
+            if col != canonical_name: # Only add to map if a rename is needed
+                rename_map[col] = canonical_name
+    
+    df.rename(columns=rename_map, inplace=True)
+    logger.info(f"Standardized column names. Mapped: {rename_map}")
+    # --- END OF FIX ---
+
+    # Now, all subsequent code can safely rely on the canonical names.
+    df.dropna(subset=['Employee ID'], inplace=True)
+    df['Employee ID'] = df['Employee ID'].astype(str).str.strip()
+
+    ids_to_exclude = ['123', 'fc', 'pc']
+    df = df[~df['Employee ID'].str.lower().str.contains('|'.join(ids_to_exclude), na=False)]
+
+    metadata_cols = list(CANONICAL_METADATA_COLS)
+    
+    date_pattern = re.compile(r'\d{1,2}-[A-Za-z]{3}-\d{2,4}')
+    date_columns = [col for col in df.columns if date_pattern.match(str(col))]
+
+    if not date_columns:
+        logger.error("No valid date columns found. Aborting analysis.")
+        return pd.DataFrame()
+
+    # This logic is now a safe fallback: it only runs if a column is TRULY missing from the file.
+    for col in ['OU Name', 'Functional Lead', 'Reporting_Manager', 'Relieving_Date']: # Also check for Relieving_Date
+        if col not in df.columns:
+            df[col] = pd.NaT if col == 'Relieving_Date' else 'N/A' # Use NaT for dates, N/A for strings
+            logger.warning(f"CRITICAL: Column '{col}' was not found in the source file at all. Using placeholder.")
+
+    # This fills empty CELLS with appropriate placeholders.
+    for col in metadata_cols:
+        if col not in df.columns:
+            df[col] = pd.NaT if col == 'Relieving_Date' else 'N/A'
+            
+    df[['Employee ID', 'Employee Name', 'Reporting_Manager', 'OU Name', 'Functional Lead', 'Email ID']] = \
+        df[['Employee ID', 'Employee Name', 'Reporting_Manager', 'OU Name', 'Functional Lead', 'Email ID']].fillna('N/A')
+    
+    if 'Relieving_Date' in df.columns:
+        df['Relieving_Date'] = pd.to_datetime(df['Relieving_Date'], errors='coerce')
+
+
+    if df['Employee ID'].duplicated().any():
+        logger.warning("Duplicate Employee IDs found. Consolidating rows...")
+        # Ensure grouping columns exist before grouping
+        grouping_keys = [key for key in ['Employee ID'] if key in df.columns]
+        if grouping_keys:
+            df = df.groupby(grouping_keys).first().reset_index()
+        
+    long_df = df.melt(
+        id_vars=metadata_cols,
+        value_vars=date_columns,
+        var_name='Date',
+        value_name='Code'
+    )
+    
+    long_df.dropna(subset=['Code'], inplace=True)
+    long_df['Code'] = long_df['Code'].astype(str).str.strip().str.upper()
+    long_df['Date'] = pd.to_datetime(long_df['Date'], format='%d-%b-%y', errors='coerce')
+    
+    logger.info(f"Successfully melted data into {len(long_df)} employee-day records.")
+    return long_df
+
+def _calculate_metrics_from_long_data(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculates presence, leave, and absenteeism from the long-format DataFrame
+    using efficient, fully vectorized operations.
+    """
+    logger.info("Step 2: Calculating metrics with vectorized operations...")
+    
+    # Initialize all metric columns to 0.0 for float precision
+    df['presence'] = 0.0
+    df['leave'] = 0.0
+    df['lwp'] = 0.0
+    df['absent'] = 0.0
+    
+    # New Feature Engineering: Track weekend and holiday work
+    df['worked_weekends'] = 0.0
+    df['worked_holidays'] = 0.0
+    
+    for code in LEAVE_BREAKDOWN_CODES:
+        df[f'leave_{code.lower()}'] = 0.0
+
+    # --- Vectorized Logic for Split Days (e.g., "CL/SL") ---
+    is_split = df['Code'].str.contains('/', na=False)
+    split_codes = df.loc[is_split, 'Code'].str.split('/', n=1, expand=True)
+    
+    if not split_codes.empty:
+        code1 = split_codes[0].str.strip()
+        code2 = split_codes[1].str.strip()
+
+        # Assign 0.5 for each part of the split day
+        df.loc[is_split, 'presence'] = (code1.isin(PRESENCE_CODES) * 0.5) + (code2.isin(PRESENCE_CODES) * 0.5)
+        df.loc[is_split, 'leave'] = (code1.isin(LEAVE_CODES) * 0.5) + (code2.isin(LEAVE_CODES) * 0.5)
+        df.loc[is_split, 'lwp'] = (code1.eq('LWP') * 0.5) + (code2.eq('LWP') * 0.5)
+        df.loc[is_split, 'absent'] = (code1.eq('ABSENT') * 0.5) + (code2.eq('ABSENT') * 0.5)
+        df.loc[is_split, 'worked_weekends'] = (code1.eq('W*') * 0.5) + (code2.eq('W*') * 0.5)
+        df.loc[is_split, 'worked_holidays'] = (code1.eq('H*') * 0.5) + (code2.eq('H*') * 0.5)
+
+        for code in LEAVE_BREAKDOWN_CODES:
+            df.loc[is_split, f'leave_{code.lower()}'] = (code1.eq(code) * 0.5) + (code2.eq(code) * 0.5)
+            
+    # --- Vectorized Logic for Full Days ---
+    full_day_mask = ~is_split
+    code_full = df.loc[full_day_mask, 'Code']
+    
+    df.loc[full_day_mask, 'presence'] = code_full.isin(PRESENCE_CODES).astype(float)
+    df.loc[full_day_mask, 'leave'] = code_full.isin(LEAVE_CODES).astype(float)
+    df.loc[full_day_mask, 'lwp'] = code_full.eq('LWP').astype(float)
+    df.loc[full_day_mask, 'absent'] = code_full.eq('ABSENT').astype(float)
+    df.loc[full_day_mask, 'worked_weekends'] = code_full.eq('W*').astype(float)
+    df.loc[full_day_mask, 'worked_holidays'] = code_full.eq('H*').astype(float)
+
+    for code in LEAVE_BREAKDOWN_CODES:
+        df.loc[full_day_mask, f'leave_{code.lower()}'] = code_full.eq(code).astype(float)
+        
+    return df
+
+def _aggregate_employee_data(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregates the daily metrics to a final, per-employee summary DataFrame.
+    """
+    logger.info("Step 3: Aggregating data to employee level...")
+
+    # Define grouping columns, ensuring they exist in the dataframe first.
+    grouping_cols = [col for col in ['Employee ID', 'Employee Name', 'Reporting_Manager', 'OU Name', 'Functional Lead'] if col in df.columns]
+    
+    # Define all numeric columns to be summed up
+    agg_cols_to_sum = ['presence', 'leave', 'lwp', 'absent', 'worked_weekends', 'worked_holidays'] + \
+                      [f'leave_{code.lower()}' for code in LEAVE_BREAKDOWN_CODES]
+
+    # *** MODIFICATION 2: Use .agg() to specify different operations for different columns. ***
+    # This allows us to SUM the metrics while keeping the FIRST instance of the Relieving_Date.
+    agg_dict = {col: 'sum' for col in agg_cols_to_sum}
+    if 'Relieving_Date' in df.columns:
+        agg_dict['Relieving_Date'] = 'first' 
+        
+    # Perform the aggregation using the dictionary
+    aggregated_df = df.groupby(grouping_cols, as_index=False).agg(agg_dict)
+    
+    # --- Engineer Final HR-defined Metrics ---
+    # Actual Absenteeism per HR definition
+    aggregated_df['total_absenteeism'] = aggregated_df['lwp'] + aggregated_df['absent']
+    
+    # Total workable days is the denominator for all our percentages
+    aggregated_df['total_workable_days'] = (
+        aggregated_df['presence'] + 
+        aggregated_df['leave'] + 
+        aggregated_df['total_absenteeism']
+    )
+    
+    # Rename columns for clarity in the final output
+    aggregated_df.rename(columns={
+        'presence': 'total_presence',
+        'leave': 'total_leave',
+    }, inplace=True)
+    
+    return aggregated_df
+--- END ---
+
+--- File: attendance/exporter.py ---
+# components/attendance/exporter.py
+
+import pandas as pd
+import io
+import logging
+
+logger = logging.getLogger(__name__)
+
+def create_excel_report(analysis_summary: dict, detailed_df: pd.DataFrame) -> bytes:
+    """
+    Generates a multi-sheet, professional Excel report in memory with detailed calculation breakdowns.
+    This version is aligned with the new, refactored analyzer output.
+    """
+    logger.info(f"Generating detailed Excel report for {len(detailed_df)} employees...")
+    output_buffer = io.BytesIO()
+    
+    company_summary = analysis_summary.get('company_summary', {})
+
+    with pd.ExcelWriter(output_buffer, engine='openpyxl') as writer:
+        
+        # --- Sheet 1: High-Level Summary ---
+        summary_data = {
+            "Metric": [
+                "Total Employees in View",
+                "Overall Presence %",
+                "Overall Leave %",
+                "Overall Absenteeism %",
+                "Total Presence Days",
+                "Total Leave Days",
+                "Total Absenteeism Days",
+                "Total Workable Days (Denominator)",
+                "Total Weekend/Holiday Work Days" # New metric
+            ],
+            "Value": [
+                company_summary.get("total_employees"),
+                f"{company_summary.get('presence_rate', 0):.2f}%",
+                f"{company_summary.get('leave_rate', 0):.2f}%",
+                f"{company_summary.get('absenteeism_rate', 0):.2f}%",
+                company_summary.get("total_presence"),
+                company_summary.get("total_leave"),
+                company_summary.get("total_absenteeism"),
+                company_summary.get("total_workable"),
+                company_summary.get("total_extra_work_days")
+            ]
+        }
+        summary_df = pd.DataFrame(summary_data)
+        summary_df.to_excel(writer, sheet_name='Summary', index=False)
+        
+
+        # --- Sheet 2: Detailed Employee Data (The "Proof" Sheet) ---
+        export_df = detailed_df.copy()
+        
+        # Engineer the new, user-facing columns for clarity
+        export_df['presence_percentage'] = (
+            # CHANGED: Using new column names
+            export_df['total_presence'] / export_df['total_workable_days'] * 100
+        ).where(export_df['total_workable_days'] > 0, 0).round(2)
+        
+        export_df['absenteeism_percentage'] = (
+            # CHANGED: Using new column names
+            export_df['total_absenteeism'] / export_df['total_workable_days'] * 100
+        ).where(export_df['total_workable_days'] > 0, 0).round(2)
+
+        # *** The "Show Your Work" Column ***
+        export_df['calculation_breakdown'] = export_df.apply(
+            # CHANGED: Using new column names
+            lambda row: f"{row['total_presence']} (Present) + {row['total_leave']} (Leave) + {row['total_absenteeism']} (Absent) = {row['total_workable_days']} Workable Days",
+            axis=1
+        )
+        
+        # Rename columns for a clean, professional-looking export
+        export_df.rename(columns={
+            # CHANGED: Using new column names from analyzer
+            'total_presence': 'presence_days',
+            'total_leave': 'leave_days',
+            'total_absenteeism': 'absenteeism_days',
+            'total_workable_days': 'total_workable_days',
+            'Employee ID': 'Employee_ID',
+            'Employee Name': 'Employee_Name',
+            'Reporting_Manager': 'Reporting_Manager',
+            'Functional Lead': 'Functional_Lead',
+            'OU Name': 'OU_Name'
+        }, inplace=True)
+        
+        # Reorder columns for a logical flow in the final report
+        final_columns = [
+            'Employee_ID', 'Employee_Name', 'OU_Name', 'Functional_Lead', 'Reporting_Manager', 
+            'presence_days', 'leave_days', 'absenteeism_days', 
+            'total_workable_days', 'presence_percentage', 'absenteeism_percentage',
+            'worked_weekends', 'worked_holidays', # ADDED: New valuable metrics
+            'calculation_breakdown'
+        ]
+        # Include leave breakdown columns if they exist
+        leave_cols = sorted([col for col in export_df.columns if col.startswith('leave_')])
+        
+        # Filter for only existing columns to prevent errors if a column is missing
+        final_columns_exist = [col for col in final_columns if col in export_df.columns]
+        leave_cols_exist = [col for col in leave_cols if col in export_df.columns]
+        
+        export_df = export_df[final_columns_exist + leave_cols_exist]
+        export_df.to_excel(writer, sheet_name='Detailed Employee Data', index=False)
+        
+        # Auto-adjust column widths for readability
+        for sheet_name in writer.sheets:
+            sheet = writer.sheets[sheet_name]
+            for col in sheet.columns:
+                max_length = 0
+                column = col[0].column_letter
+                for cell in col:
+                    try:
+                        if cell.value:
+                            cell_len = len(str(cell.value))
+                            if cell.font and cell.font.bold: cell_len += 2
+                            if cell_len > max_length: max_length = cell_len
+                    except: pass
+                adjusted_width = (max_length + 2)
+                sheet.column_dimensions[column].width = adjusted_width
+
+    logger.info("Excel report generated successfully in memory.")
+    excel_bytes = output_buffer.getvalue()
+    return excel_bytes
+--- END ---
+
+--- File: attendance/insights.py ---
+# components/attendance/insights.py
+import pandas as pd
+import logging
+
+logger = logging.getLogger(__name__)
+
+def find_consecutive_absence_streaks(daily_df, streak_threshold=4):
+    """
+    Intelligently identifies employees with N or more consecutive days of unplanned absence.
+    This version includes robust logic to correctly handle weekends and provides
+    clear, contextual start/end dates for each streak.
+    """
+    try:
+        absence_codes = {'LWP', 'ABSENT'}
+        daily_with_meta = daily_df.copy()
+        
+        daily_with_meta['Relieving_Date'] = pd.to_datetime(daily_with_meta['Relieving_Date'], errors='coerce')
+        
+        valid_absences = daily_with_meta[
+            (daily_with_meta['Code'].isin(absence_codes)) &
+            ((daily_with_meta['Relieving_Date'].isna()) | (daily_with_meta['Date'] <= daily_with_meta['Relieving_Date']))
+        ].sort_values(['Employee ID', 'Date'])
+
+        if valid_absences.empty:
+            return pd.DataFrame()
+
+        # --- THE FIX: INTELLIGENT STREAK DETECTION ---
+        # A streak is only broken if the gap between absences is > 3 days (i.e., it skips more than a weekend).
+        valid_absences['date_diff'] = valid_absences.groupby('Employee ID')['Date'].diff().dt.days
+        valid_absences['streak_id'] = (valid_absences['date_diff'] > 3).cumsum()
+        
+        # --- ENHANCEMENT: ADDING CONTEXT (START & END DATES) ---
+        streak_counts = valid_absences.groupby(['Employee ID', 'Employee Name', 'streak_id']).agg(
+            absence_start=('Date', 'min'),
+            absence_end=('Date', 'max'),
+            days_of_absence=('Date', 'size') # This is now the count of actual absent days
+        ).reset_index()
+        
+        long_streaks = streak_counts[streak_counts['days_of_absence'] >= streak_threshold]
+        
+        if not long_streaks.empty:
+            # --- ENHANCEMENT: RENAME COLUMNS FOR STAKEHOLDER CLARITY ---
+            final_df = long_streaks.rename(columns={
+                'days_of_absence': 'Consecutive Days',
+                'absence_start': 'Absence Start Date',
+                'absence_end': 'Absence End Date'
+            })
+            # Format dates for cleaner display
+            final_df['Absence Start Date'] = final_df['Absence Start Date'].dt.strftime('%Y-%m-%d')
+            final_df['Absence End Date'] = final_df['Absence End Date'].dt.strftime('%Y-%m-%d')
+            
+            return final_df[['Employee Name', 'Consecutive Days', 'Absence Start Date', 'Absence End Date']].sort_values('Consecutive Days', ascending=False)
+            
+        return pd.DataFrame()
+        
+    except Exception as e:
+        logger.error(f"Insight Error in 'find_consecutive_absence_streaks': {e}")
+        return pd.DataFrame()
+
+
+def find_day_of_week_patterns(daily_df, employee_df, pattern_threshold_pct=40, significance_threshold=4):
+    """
+    Identifies employees with a high percentage of unplanned leaves on Mondays or Fridays,
+    but only if they have a significant number of total leaves to constitute a real pattern.
+    """
+    try:
+        leave_codes = {'CL', 'SL', 'LWP', 'ABSENT'}
+        
+        leave_days = daily_df[daily_df['Code'].isin(leave_codes)].copy()
+        if leave_days.empty: return pd.DataFrame()
+            
+        leave_days['day_of_week'] = leave_days['Date'].dt.day_name()
+        total_leaves = leave_days.groupby('Employee ID').size().reset_index(name='total_leaves')
+        
+        significant_leavers = total_leaves[total_leaves['total_leaves'] >= significance_threshold]
+        if significant_leavers.empty: return pd.DataFrame()
+
+        mondays_fridays = leave_days[leave_days['day_of_week'].isin(['Monday', 'Friday'])]
+        if mondays_fridays.empty: return pd.DataFrame()
+
+        pattern_counts = mondays_fridays.groupby(['Employee ID', 'day_of_week']).size().reset_index(name='pattern_days')
+        
+        merged_df = significant_leavers.merge(pattern_counts, on='Employee ID')
+        merged_df['pattern_pct'] = (merged_df['pattern_days'] / merged_df['total_leaves'] * 100)
+        
+        significant_patterns = merged_df[merged_df['pattern_pct'] >= pattern_threshold_pct]
+
+        if not significant_patterns.empty:
+            patterns_with_names = significant_patterns.merge(employee_df[['Employee ID', 'Employee Name']], on='Employee ID', how='left')
+            patterns_with_names['Description'] = patterns_with_names.apply(
+                lambda row: f"{row['pattern_pct']:.0f}% of their {row['total_leaves']} leaves were on {row['day_of_week']}s", axis=1
+            )
+            
+            sorted_patterns = patterns_with_names.sort_values('pattern_pct', ascending=False)
+            return sorted_patterns[['Employee Name', 'Description']]
+            
+        return pd.DataFrame()
+        
+    except Exception as e:
+        logger.error(f"Insight Error in 'find_day_of_week_patterns': {e}")
+        return pd.DataFrame()
+--- END ---
+
+--- File: attendance/logic.py ---
+import pandas as pd
+from typing import Dict, List
+from .schemas import DataQualityReport, CompanySummary, ManagerSummary, EmployeeRecord
+
+# This is our centralized logic hub, containing all business calculations.
+
+def generate_attendance_summary(df: pd.DataFrame, period: str) -> dict:
+    """
+    Takes a processed, aggregated DataFrame and computes all summary statistics (KPIs).
+    """
+    if df.empty:
+        return {
+            "analysis_period": f"No data for: {period}",
+            "data_quality_report": DataQualityReport(total_employees_processed=0, employees_missing_manager_name=0, employees_with_zero_workable_days=0).dict(),
+            "company_summary": CompanySummary(total_employees=0, presence_rate=0, leave_rate=0, absenteeism_rate=0, total_presence=0, total_leave=0, total_absenteeism=0, total_workable=0, total_extra_work_days=0, leave_breakdown={}).dict(),
+            "manager_summary": []
+        }
+    dq_report = DataQualityReport(
+        total_employees_processed=len(df),
+        employees_missing_manager_name=len(df[df['Reporting_Manager'] == 'N/A']),
+        employees_with_zero_workable_days=len(df[df['total_workable_days'] <= 0])
+    )
+    total_presence = df['total_presence'].sum()
+    total_leave = df['total_leave'].sum()
+    total_absenteeism = df['total_absenteeism'].sum()
+    total_workable = df['total_workable_days'].sum()
+    total_extra_work = df['worked_weekends'].sum() + df['worked_holidays'].sum()
+    leave_breakdown_cols = [col for col in df.columns if col.startswith('leave_')]
+    company_leave_breakdown = {col.replace('leave_', '').upper(): df[col].sum() for col in leave_breakdown_cols}
+    company_summary = CompanySummary(
+        total_employees=len(df),
+        presence_rate=(total_presence / total_workable * 100) if total_workable > 0 else 0,
+        leave_rate=(total_leave / total_workable * 100) if total_workable > 0 else 0,
+        absenteeism_rate=(total_absenteeism / total_workable * 100) if total_workable > 0 else 0,
+        total_presence=total_presence,
+        total_leave=total_leave,
+        total_absenteeism=total_absenteeism,
+        total_workable=total_workable,
+        total_extra_work_days=total_extra_work,
+        leave_breakdown=company_leave_breakdown
+    )
+    manager_summary_list = []
+    if 'Reporting_Manager' in df.columns:
+        for manager_name, group in df.groupby('Reporting_Manager'):
+            team_presence = group['total_presence'].sum()
+            team_leave = group['total_leave'].sum()
+            team_absenteeism = group['total_absenteeism'].sum()
+            team_workable = group['total_workable_days'].sum()
+            team_members_records = group.to_dict(orient='records')
+            manager_entry = ManagerSummary(
+                manager_name=str(manager_name),
+                team_size=len(group),
+                presence_rate=(team_presence / team_workable * 100) if team_workable > 0 else 0,
+                leave_rate=(team_leave / team_workable * 100) if team_workable > 0 else 0,
+                absenteeism_rate=(team_absenteeism / team_workable * 100) if team_workable > 0 else 0,
+                team_members=[EmployeeRecord.parse_obj(rec) for rec in team_members_records]
+            )
+            manager_summary_list.append(manager_entry.dict())
+    return {
+        "analysis_period": f"Analysis for: {period}",
+        "data_quality_report": dq_report.dict(),
+        "company_summary": company_summary.dict(),
+        "manager_summary": manager_summary_list
+    }
+
+def calculate_monthly_trends(daily_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculates monthly trends, now intelligently handling partial start/end months
+    and creating a clean 'DisplayMonth' label for the chart's X-axis.
+    """
+    if daily_df.empty:
+        return pd.DataFrame()
+
+    daily_df = daily_df.copy()
+    daily_df['Date'] = pd.to_datetime(daily_df['Date'])
+    daily_df['Month'] = daily_df['Date'].dt.to_period('M')
+    
+    monthly_summary = daily_df.groupby('Month').agg(
+        presence=('presence', 'sum'),
+        leave=('leave', 'sum'),
+        lwp=('lwp', 'sum'),
+        absent=('absent', 'sum'),
+        days_in_data=('Date', 'nunique')
+    ).reset_index()
+    
+    monthly_summary['total_absenteeism'] = monthly_summary['lwp'] + monthly_summary['absent']
+    monthly_summary['total_workable'] = monthly_summary['presence'] + monthly_summary['leave'] + monthly_summary['total_absenteeism']
+    monthly_summary['Presence Rate'] = (monthly_summary['presence'] / monthly_summary['total_workable'] * 100).fillna(0)
+    monthly_summary['Leave Rate'] = (monthly_summary['leave'] / monthly_summary['total_workable'] * 100).fillna(0)
+    monthly_summary['Absenteeism Rate'] = (monthly_summary['total_absenteeism'] / monthly_summary['total_workable'] * 100).fillna(0)
+
+    def create_display_label(row):
+        month_period = row['Month']
+        total_days_in_month = month_period.days_in_month
+        if row['days_in_data'] < total_days_in_month:
+            return f"{month_period.strftime('%b %Y')} ({row['days_in_data']} days)"
+        else:
+            return month_period.strftime('%b %Y')
+
+    monthly_summary['DisplayMonth'] = monthly_summary.apply(create_display_label, axis=1)
+    monthly_summary['Month'] = monthly_summary['Month'].astype(str)
+    
+    return monthly_summary.sort_values('Month')
+
+# --- RE-ENGINEERED LOGIC FOR FEATURE 1: MANAGER QUADRANT ANALYSIS ---
+def get_manager_quadrant_analysis(df: pd.DataFrame) -> dict:
+    """
+    Performs a full quadrant analysis on manager performance, categorizing each manager
+    and returning a structured dictionary for the strategic briefing.
+    """
+    if df.empty or 'Reporting_Manager' not in df.columns:
+        return {"matrix_data": pd.DataFrame(), "analysis": {}}
+
+    manager_groups = df.groupby('Reporting_Manager')
+    
+    manager_metrics = []
+    for name, group in manager_groups:
+        if name == 'N/A' or len(group) == 0:
+            continue
+
+        total_workable = group['total_workable_days'].sum()
+        total_presence = group['total_presence'].sum()
+        total_absenteeism = group['total_absenteeism'].sum()
+        total_extra_days = group['worked_weekends'].sum() + group['worked_holidays'].sum()
+
+        absenteeism_rate = (total_absenteeism / total_workable * 100) if total_workable > 0 else 0
+        extra_effort_rate = (total_extra_days / total_presence * 100) if total_presence > 0 else 0
+
+        manager_metrics.append({
+            'manager_name': name,
+            'team_size': len(group),
+            'absenteeism_rate': absenteeism_rate,
+            'extra_effort_rate': extra_effort_rate
+        })
+    
+    matrix_data = pd.DataFrame(manager_metrics)
+    if matrix_data.empty:
+        return {"matrix_data": pd.DataFrame(), "analysis": {}}
+
+    # --- Categorization Logic ---
+    avg_absenteeism = matrix_data['absenteeism_rate'].mean()
+    avg_effort = matrix_data['extra_effort_rate'].mean()
+
+    analysis = {
+        "avg_absenteeism": avg_absenteeism,
+        "avg_effort": avg_effort,
+        "star_performers": [],
+        "burnout_risk": [],
+        "stable_uninspired": [],
+        "high_risk": []
+    }
+
+    for index, row in matrix_data.iterrows():
+        is_low_absenteeism = row['absenteeism_rate'] <= avg_absenteeism
+        is_high_effort = row['extra_effort_rate'] >= avg_effort
+        
+        manager_record = {
+            "name": row['manager_name'],
+            "absenteeism": f"{row['absenteeism_rate']:.1f}%",
+            "effort": f"{row['extra_effort_rate']:.1f}%"
+        }
+
+        if is_low_absenteeism and is_high_effort:
+            analysis["star_performers"].append(manager_record)
+        elif not is_low_absenteeism and is_high_effort:
+            analysis["burnout_risk"].append(manager_record)
+        elif is_low_absenteeism and not is_high_effort:
+            analysis["stable_uninspired"].append(manager_record)
+        else: # High absenteeism, low effort
+            analysis["high_risk"].append(manager_record)
+            
+    return {"matrix_data": matrix_data, "analysis": analysis}
+# --- END OF RE-ENGINEERED LOGIC ---```
+--- END ---
+
+--- File: attendance/router.py ---
+# components/attendance/router.py
+
+from fastapi import APIRouter, UploadFile, File
+
+# Import the Pydantic model for response validation.
+from .schemas import AttendanceAnalysisResponse
+
+# Import our backend modules:
+# - analyzer: Handles the raw data processing from the Excel file.
+# - logic: Contains the centralized business logic for KPI calculations.
+from . import analyzer, logic
+
+router = APIRouter(
+    prefix="/analyze/attendance",
+    tags=["Attendance Analysis"]
+)
+
+@router.post("/", response_model=AttendanceAnalysisResponse)
+async def analyze_attendance_endpoint(file: UploadFile = File(...)):
+    """
+    Analyzes the uploaded HR attendance Excel file and returns a structured JSON response.
+    
+    This endpoint orchestrates the analysis pipeline:
+    1. Reads the uploaded file into memory.
+    2. Calls the core analyzer to process the data into structured DataFrames.
+    3. Calls the centralized logic module to calculate all KPIs and summaries.
+    4. Validates the final result against the response model and returns it.
+    """
+    file_contents = await file.read()
+    
+    # Step 1: Call the core analysis engine.
+    # This correctly unpacks the tuple, getting the aggregated employee data.
+    # The daily data is ignored here with '_' as it is not needed for this API response.
+    aggregated_df, _ = analyzer.analyze_attendance(file_contents)
+    
+    # Step 2: Call the single, authoritative source for all business logic and calculations.
+    # This replaces the old, duplicated _build_response_from_df function.
+    analysis_results = logic.generate_attendance_summary(aggregated_df, "Overall")
+
+    # Step 3: Pydantic validates the dictionary and returns the final JSON response.
+    return AttendanceAnalysisResponse(**analysis_results)
+--- END ---
+
+--- File: attendance/schemas.py ---
+# components/attendance/schemas.py
+from pydantic import BaseModel, Field, Extra
+from typing import List, Dict, Any
+
+# --- This file is now fully aligned with the output of the new analyzer.py ---
+
+class DataQualityReport(BaseModel):
+    total_employees_processed: int
+    employees_missing_manager_name: int
+    employees_with_zero_workable_days: int
+
+class CompanySummary(BaseModel):
+    total_employees: int
+    presence_rate: float
+    leave_rate: float
+    absenteeism_rate: float
+    total_presence: float
+    total_leave: float
+    total_absenteeism: float
+    total_workable: float
+    total_extra_work_days: float
+    leave_breakdown: Dict[str, float]
+
+# This schema models a single row of our final aggregated DataFrame.
+# It must match the columns exactly.
+class EmployeeRecord(BaseModel):
+    Employee_ID: str = Field(alias='Employee ID')
+    Employee_Name: str = Field(alias='Employee Name')
+    Reporting_Manager: str
+    OU_Name: str = Field(alias='OU Name')
+    Functional_Lead: str = Field(alias='Functional Lead')
+    total_presence: float
+    total_leave: float
+    total_absenteeism: float
+    total_workable_days: float
+    worked_weekends: float
+    worked_holidays: float
+    # Use Extra.allow to dynamically accept all 'leave_*' columns
+    class Config:
+        extra = 'allow'
+        anystr_strip_whitespace = True
+        allow_population_by_field_name = True
+
+
+class ManagerSummary(BaseModel):
+    manager_name: str
+    team_size: int
+    presence_rate: float
+    leave_rate: float
+    absenteeism_rate: float
+    team_members: List[EmployeeRecord]
+
+
+class AttendanceAnalysisResponse(BaseModel):
+    analysis_period: str
+    data_quality_report: DataQualityReport
+    company_summary: CompanySummary
+    manager_summary: List[ManagerSummary]
+--- END ---
+
+--- File: attendance/app/review_app.py ---
+# components/attendance/app/review_app.py
+
+import streamlit as st
+import pandas as pd
+from datetime import datetime
+import sys
+import os
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+# --- Path Setup ---
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+from attendance import analyzer, exporter, logic, insights
+from core import ai_services
+
+# --- Page Configuration ---
+st.set_page_config(page_title="HR-Insight | Executive Command Center", page_icon="💎", layout="wide")
+
+# --- === "MIDNIGHT SLATE & GOLD" UI/UX === ---
+
+def load_css():
+    """Injects custom CSS for the ultra-luxe, C-suite theme."""
+    css = """
+    <style>
+        /* --- Import Google Fonts: Inter for UI, Plus Jakarta Sans for Headers --- */
+        @import url('https://fonts.googleapis.com/css2?family+Jakarta+Sans:wght@600;700;800&family=Inter:wght@400;500;600&display=swap');
+
+        /* --- Color & Font Design Tokens --- */
+        :root {
+            /* Palette: Deep, sophisticated, and focused */
+            --primary-bg: #111111; /* Near-black for the main background */
+            --secondary-bg: #1E1E1E; /* Slightly lighter for cards and elements */
+            --border-color: #333333; /* Subtle borders for definition */
+            --text-color: #EAEAEA; /* Primary text, soft white */
+            --subtle-text-color: #A0A0A0; /* Secondary text, for labels and descriptions */
+            
+            /* Accents: Deliberate and impactful */
+            --primary-accent: #00A99D; /* A slightly richer, deeper Teal */
+            --highlight-accent: #D4AF37; /* Classic, rich Gold for AI and key highlights */
+            --risk-color: #E57373; /* A softer, less jarring red for negative deltas */
+            --warning-color: #FBC02D; /* A clear yellow for caution */
+
+            /* Typography */
+            --header-font: 'Plus Jakarta Sans', sans-serif;
+            --body-font: 'Inter', sans-serif;
+        }
+
+        /* --- Global Styles --- */
+        .stApp {
+            background-color: var(--primary-bg);
+            color: var(--text-color);
+        }
+        h1, h2, h3, h4, h5, h6 {
+            font-family: var(--header-font);
+            font-weight: 700;
+            color: var(--text-color);
+        }
+        p, .stMarkdown, .stDataFrame, .stSelectbox {
+            font-family: var(--body-font);
+            color: var(--text-color);
+        }
+        .stMarkdown h5 {
+            font-weight: 400;
+            color: var(--subtle-text-color);
+            letter-spacing: 0.5px;
+        }
+
+        /* --- Main Title & Header --- */
+        .stApp > header {
+            background-color: transparent;
+        }
+        div[data-testid="stToolbar"] {
+            display: none; /* Hide Streamlit's default toolbar for a cleaner look */
+        }
+
+        /* --- Sidebar Overhaul --- */
+        div[data-testid="stSidebar"] {
+            background: linear-gradient(180deg, rgba(30,30,30,0.95) 0%, rgba(17,17,17,0.95) 100%);
+            backdrop-filter: blur(10px);
+            border-right: 1px solid var(--border-color);
+        }
+        .stSidebar h2, .stSidebar h3, .stSidebar .stMarkdown {
+            color: var(--text-color);
+        }
+
+        /* --- Custom Component Styles: The KPI Card --- */
+        .kpi-card {
+            background: var(--secondary-bg);
+            border-radius: 16px;
+            padding: 24px;
+            border: 1px solid var(--border-color);
+            transition: all 0.3s ease;
+            height: 100%;
+        }
+        .kpi-card:hover {
+            border-color: var(--highlight-accent);
+            transform: translateY(-5px);
+            box-shadow: 0px 10px 30px rgba(212, 175, 55, 0.1);
+        }
+        .kpi-title {
+            font-family: var(--body-font);
+            font-size: 0.95rem;
+            font-weight: 500;
+            color: var(--subtle-text-color);
+            margin-bottom: 8px;
+        }
+        .kpi-value {
+            font-family: var(--header-font);
+            font-size: 2.75rem;
+            font-weight: 800;
+            color: var(--text-color);
+            line-height: 1.1;
+        }
+        .kpi-delta {
+            font-family: var(--body-font);
+            font-size: 0.9rem;
+            font-weight: 500;
+        }
+
+        /* --- AI Summary Card: The "Gemini Gem" --- */
+        .ai-summary-card {
+            background: linear-gradient(135deg, #2a2a2a, #1a1a1a);
+            border-left: 4px solid var(--highlight-accent);
+            padding: 24px;
+            border-radius: 12px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.2);
+        }
+        .ai-summary-card p {
+            font-size: 1.05rem;
+            line-height: 1.6;
+        }
+
+        /* --- Controls & Buttons --- */
+        .stButton>button {
+            border-radius: 8px;
+            background: var(--highlight-accent);
+            color: var(--primary-bg);
+            border: none;
+            padding: 12px 24px;
+            font-family: var(--body-font);
+            font-weight: 600;
+            transition: all 0.2s ease;
+        }
+        .stButton>button:hover {
+            filter: brightness(1.1);
+        }
+        .stDownloadButton>button {
+            border-radius: 8px;
+            background-color: var(--secondary-bg);
+            color: var(--primary-accent);
+            border: 1px solid var(--primary-accent);
+            font-weight: 600;
+        }
+    </style>
+    """
+    st.markdown(css, unsafe_allow_html=True)
+
+def create_plotly_pie_chart(data: dict):
+    # ... (code remains unchanged)
+    if not data: return None
+    df = pd.DataFrame(list(data.items()), columns=['Leave Type', 'Days']).sort_values('Leave Type')
+    colors = ['#00A99D', '#00796B', '#004D40', '#4DB6AC', '#80CBC4'] 
+    fig = px.pie(df, values='Days', names='Leave Type', hole=0.5, color_discrete_sequence=colors)
+    fig.update_traces(textposition='inside', textinfo='percent+label', hoverinfo='label+value+percent',
+                      marker=dict(line=dict(color= 'var(--secondary-bg)', width=3)),
+                      textfont_size=14)
+    fig.update_layout(showlegend=False, margin=dict(t=20, b=20, l=20, r=20),
+                      paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+                      font=dict(family="Inter, sans-serif", color="var(--text-color)"))
+    return fig
+
+def create_subplots_trend_charts(trend_data: pd.DataFrame):
+    # ... (code remains unchanged)
+    if trend_data.empty or len(trend_data) < 2:
+        return None
+
+    fig = make_subplots(
+        rows=3, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.12,
+        subplot_titles=("Presence Rate Trend", "Leave Rate Trend", "Absenteeism Rate Trend")
+    )
+
+    metrics = {
+        "Presence Rate": {"color": "#00A99D", "row": 1},
+        "Leave Rate": {"color": "#FBC02D", "row": 2},
+        "Absenteeism Rate": {"color": "#E57373", "row": 3}
+    }
+
+    for metric, config in metrics.items():
+        fig.add_trace(
+            go.Scatter(
+                x=trend_data['DisplayMonth'],
+                y=trend_data[metric],
+                mode='lines+markers',
+                name=metric,
+                line=dict(color=config['color'], width=2.5),
+                marker=dict(size=7)
+            ),
+            row=config['row'], col=1
+        )
+        fig.update_yaxes(title_text="%", row=config['row'], col=1, title_standoff=10)
+
+    fig.update_layout(
+        height=700,
+        showlegend=False,
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        font=dict(family="Inter, sans-serif", color="var(--subtle-text-color)"),
+        margin=dict(l=50, r=40, t=50, b=50)
+    )
+    
+    for annotation in fig['layout']['annotations']:
+        annotation['font']['size'] = 16
+        annotation['font']['family'] = 'Plus Jakarta Sans, sans-serif'
+        annotation['font']['color'] = 'var(--text-color)'
+        annotation['x'] = 0.0
+        annotation['xanchor'] = 'left'
+
+    fig.update_xaxes(gridcolor='var(--border-color)', showline=False, tickfont=dict(size=12))
+    fig.update_yaxes(gridcolor='var(--border-color)', zeroline=False, showline=False, tickfont=dict(size=12))
+
+    return fig
+
+# --- Main App Execution ---
+load_css()
+
+if 'master_df' not in st.session_state: st.session_state.master_df = pd.DataFrame()
+if 'daily_df' not in st.session_state: st.session_state.daily_df = pd.DataFrame()
+if 'file_name' not in st.session_state: st.session_state.file_name = None
+
+st.title("💎 HR-Insight Executive Command Center")
+st.markdown("##### Strategic Attendance Intelligence for C-Suite Decision-Making")
+st.markdown("---")
+
+uploaded_file = st.file_uploader("Upload Adrenalin Max Attendance Report", type=['xlsx', 'xls'])
+
+if uploaded_file:
+    if st.session_state.file_name != uploaded_file.name:
+        st.session_state.file_name = uploaded_file.name
+        with st.spinner("Processing strategic data..."):
+            file_bytes = uploaded_file.getvalue()
+            st.session_state.master_df, st.session_state.daily_df = analyzer.analyze_attendance(file_bytes)
+        st.success(f"File '{uploaded_file.name}' processed successfully!")
+        st.rerun()
+
+if not st.session_state.master_df.empty:
+    master_df = st.session_state.master_df
+    daily_df = st.session_state.daily_df
+
+    # ... (Sidebar and filtering logic remains unchanged)
+    st.sidebar.header("Filters & Actions")
+    ou_list = ["(All OUs)"] + sorted(master_df['OU Name'].unique().tolist())
+    selected_ou = st.sidebar.selectbox("Filter by Business Unit (OU)", ou_list)
+    ou_filtered_df = master_df if selected_ou == "(All OUs)" else master_df[master_df['OU Name'] == selected_ou]
+    
+    fl_list = ["(All Functional Leads)"] + sorted(ou_filtered_df['Functional Lead'].unique().tolist())
+    selected_fl = st.sidebar.selectbox("Filter by Functional Lead", fl_list)
+    fl_filtered_df = ou_filtered_df if selected_fl == "(All Functional Leads)" else ou_filtered_df[ou_filtered_df['Functional Lead'] == selected_fl]
+    
+    mgr_list = ["(All Reporting Managers)"] + sorted(fl_filtered_df['Reporting_Manager'].unique().tolist())
+    selected_mgr = st.sidebar.selectbox("Filter by Reporting Manager", mgr_list)
+    filtered_df = fl_filtered_df if selected_mgr == "(All Reporting Managers)" else fl_filtered_df[fl_filtered_df['Reporting_Manager'] == selected_mgr]
+
+    employee_ids_in_view = filtered_df['Employee ID'].unique()
+    filtered_daily_df = daily_df[daily_df['Employee ID'].isin(employee_ids_in_view)]
+    
+    company_summary_data = logic.generate_attendance_summary(master_df, "Company-Wide")
+    company_kpis = company_summary_data.get('company_summary', {})
+    
+    filtered_summary_data = logic.generate_attendance_summary(filtered_df, "Current View")
+    filtered_kpis = filtered_summary_data.get('company_summary', {})
+    
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Download Report")
+    excel_bytes = exporter.create_excel_report(filtered_summary_data, filtered_df)
+    st.sidebar.download_button(
+        label="📥 Download Detailed Report", data=excel_bytes,
+        file_name=f"HR_Insight_Report_{selected_ou}_{selected_fl}_{selected_mgr}_{datetime.now().strftime('%Y%m%d')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+    tab1, tab2, tab3, tab4 = st.tabs(["📈 KPI Overview", "🧠 AI Strategic Briefing", "🏢 Team Deep Dive", "📊 Leadership Scorecard"])
+
+    with tab1:
+        # ... (code for tab1 remains unchanged)
+        st.header(f"Analysis for: {selected_ou} | {selected_fl} | {selected_mgr}")
+        
+        if filtered_kpis.get("total_employees", 0) > 0:
+            cols = st.columns(4)
+            
+            with cols[0]:
+                pr_delta = filtered_kpis['presence_rate'] - company_kpis.get('presence_rate', 0)
+                delta_color = "var(--primary-accent)" if pr_delta >= 0 else "var(--risk-color)"
+                st.markdown(f"""<div class="kpi-card"><div class="kpi-title">Presence Rate</div><div class="kpi-value">{filtered_kpis['presence_rate']:.1f}%</div><div class="kpi-delta" style="color:{delta_color};">{pr_delta:+.1f}% vs. Company Avg.</div></div>""", unsafe_allow_html=True)
+
+            with cols[1]:
+                lr_delta = filtered_kpis['leave_rate'] - company_kpis.get('leave_rate', 0)
+                delta_color = "var(--risk-color)" if lr_delta >= 0 else "var(--primary-accent)"
+                st.markdown(f"""<div class="kpi-card"><div class="kpi-title">Leave Rate</div><div class="kpi-value">{filtered_kpis['leave_rate']:.1f}%</div><div class="kpi-delta" style="color:{delta_color};">{lr_delta:+.1f}% vs. Company Avg.</div></div>""", unsafe_allow_html=True)
+
+            with cols[2]:
+                ar_delta = filtered_kpis['absenteeism_rate'] - company_kpis.get('absenteeism_rate', 0)
+                delta_color = "var(--risk-color)" if ar_delta >= 0 else "var(--primary-accent)"
+                st.markdown(f"""<div class="kpi-card"><div class="kpi-title">Absenteeism Rate</div><div class="kpi-value">{filtered_kpis['absenteeism_rate']:.1f}%</div><div class="kpi-delta" style="color:{delta_color};">{ar_delta:+.1f}% vs. Company Avg.</div></div>""", unsafe_allow_html=True)
+
+            with cols[3]:
+                st.markdown(f"""<div class="kpi-card"><div class="kpi-title">Filtered Employees</div><div class="kpi-value">{filtered_kpis['total_employees']}</div><div class="kpi-delta" style="color:var(--subtle-text-color);">&nbsp;</div></div>""", unsafe_allow_html=True)
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            col1, col2 = st.columns([0.4, 0.6])
+            with col1:
+                st.subheader("Leave Breakdown")
+                fig_pie = create_plotly_pie_chart(filtered_kpis.get('leave_breakdown', {}))
+                if fig_pie: st.plotly_chart(fig_pie, use_container_width=True)
+            with col2:
+                st.subheader("Monthly Attendance Trends")
+                monthly_trends_for_chart = logic.calculate_monthly_trends(filtered_daily_df)
+                fig_trends = create_subplots_trend_charts(monthly_trends_for_chart)
+                if fig_trends: st.plotly_chart(fig_trends, use_container_width=True)
+        else:
+            st.info("No data available for the current filter selection.")
+
+    with tab2:
+        # ... (code for tab2 remains unchanged)
+        st.header(f"AI Strategic Briefing for: {selected_ou} | {selected_fl} | {selected_mgr}")
+        consecutive_absences = insights.find_consecutive_absence_streaks(filtered_daily_df)
+        dow_patterns = insights.find_day_of_week_patterns(filtered_daily_df, filtered_df)
+        
+        st.subheader("Gemini AI Analyst")
+        st.markdown("Generate a top-line summary, identify key risks, and receive actionable recommendations from our integrated AI strategist.")
+        if st.button("🤖 Generate Strategic Briefing"):
+            with st.spinner("AI Strategist is analyzing the data portfolio..."):
+                prompt = f"""
+                As a C-Suite level HR Strategist, provide an executive briefing based on the following attendance data for the group: {selected_ou} | {selected_fl} | {selected_mgr}.
+                Your audience is the CEO. Be concise, direct, and focus on business impact.
+
+                **Data Points:**
+                - Total Employees: {filtered_kpis.get('total_employees', 0)}
+                - Presence Rate: {filtered_kpis.get('presence_rate', 0):.2f}%
+                - Leave Rate: {filtered_kpis.get('leave_rate', 0):.2f}%
+                - Absenteeism Rate: {filtered_kpis.get('absenteeism_rate', 0):.2f}%
+
+                **Automated Red Flags:**
+                """
+                if not consecutive_absences.empty:
+                    prompt += f"\n- **Attrition Risk - Long Absences:** {len(consecutive_absences)} employee(s) show long, consecutive unplanned absences, signaling potential burnout or personal issues that could lead to attrition."
+                if not dow_patterns.empty:
+                    prompt += f"\n- **Engagement Risk - Weekend Adjacency:** {len(dow_patterns)} employee(s) exhibit a pattern of Mon/Fri absences, suggesting potential disengagement or work-life imbalance."
+                if consecutive_absences.empty and dow_patterns.empty:
+                    prompt += "\n- No significant negative attendance patterns were automatically flagged. This indicates good operational stability in this cohort."
+
+                prompt += """
+
+                **Executive Briefing Structure:**
+                1.  **Top-Line Assessment:** A single, powerful sentence to describe the workforce health of this group.
+                2.  **Strategic Risks:** Bullet points identifying the most critical risks to the business (e.g., "Risk of project delays due to high absenteeism," "Potential for decreased morale...").
+                3.  **C-Suite Recommendations:** 2-3 high-level, strategic recommendations for leadership to consider (e.g., "Direct managers to conduct confidential wellness checks," "Review team workload and deadlines to mitigate burnout risk.").
+                """
+                ai_summary = ai_services.generate_narrative(prompt)
+                st.markdown(f'<div class="ai-summary-card">{ai_summary}</div>', unsafe_allow_html=True)
+        
+        st.markdown("---")
+        st.subheader("Detailed Findings (Red Flags)")
+        st.markdown("Prioritized alerts based on automated analysis of attendance patterns.")
+        with st.expander(f"🚩 Long Absence Streaks ({len(consecutive_absences)} found)", expanded=not consecutive_absences.empty):
+            st.markdown("**Business Impact:** Long, unplanned absence streaks can be an early indicator of significant personal issues, health problems, or employee burnout. They pose a direct risk to productivity and team morale, and may be a precursor to employee turnover.")
+            if not consecutive_absences.empty: st.dataframe(consecutive_absences, use_container_width=True)
+            else: st.success("No employees met the criteria for long absence streaks in this view.")
+        with st.expander(f"⚠️ Weekend Adjacency Patterns ({len(dow_patterns)} found)", expanded=not dow_patterns.empty):
+            st.markdown("**Business Impact:** A strong pattern of unplanned absences on Mondays or Fridays can suggest issues with work-life balance or low engagement. This can erode team productivity over time and may indicate underlying cultural issues that need addressing.")
+            if not dow_patterns.empty: st.dataframe(dow_patterns, use_container_width=True)
+            else: st.success("No employees showed a significant pattern of Mon/Fri absences in this view.")
+
+    with tab3:
+        # ... (code for tab3 remains unchanged)
+        st.header("Hierarchical Team Drill-Down")
+        st.markdown("Analyze performance by manager. Status indicators highlight teams with absenteeism over the 7% threshold.")
+        
+        if filtered_df.empty:
+            st.info("No manager data to display for the current filter selection.")
+        else:
+            for fl_name, fl_group in filtered_df.groupby('Functional Lead'):
+                st.subheader(f"Functional Lead: {fl_name}")
+                for mgr_name, mgr_group in fl_group.groupby('Reporting_Manager'):
+                    mgr_summary = logic.generate_attendance_summary(mgr_group, mgr_name)
+                    mgr_kpis = mgr_summary.get('company_summary', {})
+                    rate = mgr_kpis.get('absenteeism_rate', 0)
+                    
+                    status_icon = "⚠️" if rate > 7.0 else "✅"
+                    expander_label = (
+                        f"**{mgr_name}** ({mgr_kpis.get('total_employees', 0)} Employees) | "
+                        f"Absenteeism Rate: **{rate:.1f}%** {status_icon}"
+                    )
+                    
+                    with st.expander(expander_label):
+                        display_group = mgr_group.rename(columns={
+                            'Employee ID': 'Emp. ID', 'Employee Name': 'Name',
+                            'total_presence': 'Present', 'total_leave': 'Leave',
+                            'total_absenteeism': 'Absent', 'total_workable_days': 'Workable Days'
+                        })
+                        st.dataframe(display_group[[
+                            'Emp. ID', 'Name', 'Present', 'Leave', 'Absent', 'Workable Days'
+                        ]], use_container_width=True)
+    
+    with tab4:
+        st.header("Leadership Scorecard: Strategic Overview")
+        st.markdown("This analysis provides a clear, data-driven summary of manager performance, focusing on team health and engagement.")
+
+        manager_analysis_result = logic.get_manager_quadrant_analysis(fl_filtered_df)
+        matrix_data = manager_analysis_result.get("matrix_data", pd.DataFrame())
+        analysis_summary = manager_analysis_result.get("analysis", {})
+
+        if not matrix_data.empty and len(matrix_data) > 1:
+            # --- The new, self-explanatory methodology section ---
+            with st.expander("Methodology & Definitions: Understanding the Data", expanded=True):
+                st.markdown("""
+                This analysis categorizes each manager into one of four groups to identify leadership effectiveness and potential team health issues. Here is a complete breakdown of the methodology:
+
+                **1. The Metrics (The Columns)**
+                - **Absenteeism %**: Calculated as `(Unplanned Absences / Total Workable Days) * 100`. This uses the `LWP` and `ABSENT` codes from the raw data. It is the primary indicator of team health. **High percentages are a major red flag.**
+                - **Extra Effort %**: Calculated as `(Weekend & Holiday Work / Total Present Days) * 100`. This uses the `W*` and `H*` codes. It reflects team commitment, but a very high rate can be an early warning sign of burnout.
+                - **Team Size**: The number of employees reporting to the manager.
+
+                **2. The Status Categories (The Story)**
+                The categories are determined by comparing each manager's metrics against the average for the entire group.
+                - **🔥 Burnout Risk**: Managers whose teams have **above-average absenteeism** AND **above-average extra effort**. This is the most critical group, signifying unsustainable pressure.
+                - **🚩 High Risk**: Managers whose teams have **above-average absenteeism** but **below-average extra effort**. This indicates potential issues with low engagement, poor morale, or ineffective leadership.
+                - **✅ Star Performer**: Managers whose teams have **below-average absenteeism** but **above-average extra effort**. These are highly engaged and committed teams.
+                - **⚖️ Stable Cluster**: Managers whose teams have **below-average absenteeism** AND **below-average extra effort**. This is the reliable, consistent core of the organization.
+                """)
+
+            # --- Engineer the final DataFrame for display ---
+            if not matrix_data.empty:
+                display_df = matrix_data.copy()
+                
+                # Create a mapping from manager name to their quadrant
+                manager_to_quadrant = {}
+                for quadrant, managers in analysis_summary.items():
+                    if isinstance(managers, list):
+                        for manager in managers:
+                            manager_to_quadrant[manager['name']] = quadrant
+
+                display_df['quadrant'] = display_df['manager_name'].map(manager_to_quadrant)
+                
+                status_map = {
+                    "star_performers": "✅ Star Performer",
+                    "burnout_risk": "🔥 Burnout Risk",
+                    "stable_uninspired": "⚖️ Stable Cluster",
+                    "high_risk": "🚩 High Risk"
+                }
+                display_df['Status'] = display_df['quadrant'].map(status_map)
+
+                # Format and select final columns
+                display_df.rename(columns={
+                    'manager_name': 'Manager',
+                    'team_size': 'Team Size',
+                    'absenteeism_rate': 'Absenteeism %',
+                    'extra_effort_rate': 'Extra Effort %'
+                }, inplace=True)
+
+                final_df = display_df[['Status', 'Manager', 'Team Size', 'Absenteeism %', 'Extra Effort %']].sort_values(by="Absenteeism %", ascending=False)
+                
+                st.subheader("Strategic Manager Overview")
+                st.markdown("Use the color-coding to instantly identify areas of concern. Sort by clicking on column headers.")
+                
+                # Display the styled DataFrame
+                st.dataframe(
+                    final_df.style
+                        .background_gradient(cmap='Reds', subset=['Absenteeism %'])
+                        .background_gradient(cmap='YlOrBr', subset=['Extra Effort %'])
+                        .format({
+                            'Absenteeism %': '{:.1f}%',
+                            'Extra Effort %': '{:.1f}%'
+                        }),
+                    use_container_width=True
+                )
+
+        else:
+            st.info("Not enough manager data to generate the performance analysis (at least 2 managers are required for comparison).")
+
+else:
+    st.info("Please upload an attendance file to begin the analysis.")
+--- END ---
+
+--- File: core/__init__.py ---
+
+--- END ---
+
+--- File: core/ai_services.py ---
+# core/ai_services.py
+
+import google.generativeai as genai
+from .config import settings # We already import our settings
+
+# Configure the library once when the application starts
+# This part is fine.
+if settings.GEMINI_API_KEY != "API_KEY_NOT_FOUND":
+    genai.configure(api_key=settings.GEMINI_API_KEY)
+
+def generate_narrative(prompt: str) -> str:
+    # --- THIS IS THE CORRECTED LOGIC ---
+    # Instead of checking 'genai.config', we check our own 'settings' object.
+    # This is more reliable.
+    if settings.GEMINI_API_KEY == "API_KEY_NOT_FOUND":
+        return "AI narrative generation skipped. GEMINI_API_KEY is not configured in the .env file."
+
+    try:
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        # Add a helpful message for invalid API key errors
+        if "API_KEY_INVALID" in str(e) or "PermissionDenied" in str(e):
+            return "AI narrative could not be generated. The provided Gemini API key is invalid or expired."
+        # Generic error for other issues
+        return f"AI narrative could not be generated. Error: {e}"
+--- END ---
+
+--- File: core/config.py ---
+# core/config.py
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class Settings(BaseSettings):
+    GEMINI_API_KEY: str = "API_KEY_NOT_FOUND"
+
+    model_config = SettingsConfigDict(env_file=".env")
+
+settings = Settings()
+--- END ---
+
+--- File: exit_analysis/__init__.py ---
+
+--- END ---
+
+--- File: exit_analysis/analyzer.py ---
+# components/exit_analysis/analyzer.py
+
+import pandas as pd
+import re
+import logging
+import io
+
+# --- Setup logging for traceability ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+# --- Main Analysis Pipeline ---
+
+def process_exit_data(file_contents: bytes) -> pd.DataFrame:
+    """
+    Main orchestration function. Reads, cleans, and pivots the exit interview data.
+    
+    Args:
+        file_contents: The raw bytes of the uploaded Excel file.
+
+    Returns:
+        A cleaned Pandas DataFrame where each row represents one employee's
+        consolidated exit feedback.
+    """
+    logger.info("Starting exit data processing pipeline...")
+    
+    try:
+        # --- THE FINAL FIX ---
+        # By removing the 'engine' argument, pandas will now automatically use
+        # 'xlrd' for .xls files and 'openpyxl' for .xlsx files.
+        # This makes our component robust to both formats.
+        raw_df = pd.read_excel(io.BytesIO(file_contents))
+        logger.info(f"Successfully read Excel file. Found {len(raw_df)} total rows.")
+    except Exception as e:
+        logger.error(f"Failed to read data file. It must be a valid Excel (.xlsx, .xls) file. Error: {e}")
+        return pd.DataFrame()
+
+    if raw_df.empty:
+        return pd.DataFrame()
+
+    pivoted_df = _pivot_and_consolidate(raw_df)
+    
+    logger.info(f"Processing complete. Consolidated data for {len(pivoted_df)} unique employees.")
+    
+    return pivoted_df
+
+
+# --- Helper Functions ---
+
+def _pivot_and_consolidate(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Transforms the long-format exit data (one row per question) into a wide-format
+    DataFrame (one row per employee).
+    """
+    logger.info("Step 1: Pivoting data to consolidate rows per employee...")
+
+    identifier_cols = [
+        'DATEOFJOINING', 'DOB', 'GENDER', 'DESIGNATION', 
+        'RESIGNATIONLETTERDATE', 'ACTUALRELIEVINGDATE', 'SEPARATIONTYPE', 
+        'RESIGNATIONREASON'
+    ]
+    
+    missing_cols = [col for col in identifier_cols if col not in df.columns]
+    if missing_cols:
+        logger.error(f"Source file is missing required identifier columns: {missing_cols}. Aborting.")
+        return pd.DataFrame()
+
+    pivot_index = identifier_cols
+    pivot_columns = 'QUESTION_DESC'
+    pivot_values = 'CHOICE_OR_COMMENTS'
+
+    try:
+        pivoted = df.pivot_table(
+            index=pivot_index,
+            columns=pivot_columns,
+            values=pivot_values,
+            aggfunc='first'
+        ).reset_index()
+        
+        pivoted.columns = [re.sub(r'[^0-9a-zA-Z_]', '', str(col).replace(' ', '_')).lower() for col in pivoted.columns]
+        
+        logger.info("Successfully pivoted data.")
+        return pivoted
+
+    except Exception as e:
+        logger.error(f"Failed during the pivot operation. Check data format. Error: {e}")
+        return pd.DataFrame()
+--- END ---
+
+--- File: exit_analysis/logic.py ---
+# components/exit_analysis/logic.py
+
+import pandas as pd
+import logging
+import nltk
+import re
+import os
+
+# --- Import our core AI service for theme interpretation ---
+from core import ai_services
+
+# --- NLTK Setup: Self-Contained and Robust ---
+# We ensure the app looks for NLTK data within our project folder first.
+LOCAL_NLTK_DATA_PATH = os.path.join(os.path.dirname(__file__), '..', 'nltk_data')
+if os.path.exists(LOCAL_NLTK_DATA_PATH):
+    nltk.data.path.insert(0, LOCAL_NLTK_DATA_PATH)
+
+from nltk.stem import WordNetLemmatizer
+# This will reliably download the 'wordnet' package to our local folder if it's missing.
+try:
+    nltk.data.find('corpora/wordnet')
+except LookupError:
+    nltk.download('wordnet', quiet=True, download_dir=LOCAL_NLTK_DATA_PATH)
+# --- End of NLTK Setup ---
+
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import LatentDirichletAllocation
+
+# --- Global Configuration ---
+logger = logging.getLogger(__name__)
+
+STOP_WORDS = {
+    'a', 'about', 'above', 'after', 'again', 'against', 'all', 'am', 'an', 'and', 'any', 'are', "aren't", 'as', 'at',
+    'be', 'because', 'been', 'before', 'being', 'below', 'between', 'both', 'but', 'by', 'can', "can't", 'cannot',
+    'could', "couldn't", 'did', "didn't", 'do', 'does', "doesn't", 'doing', 'don', "don't", 'down', 'during', 'each',
+    'few', 'for', 'from', 'further', 'had', "hadn't", 'has', "hasn't", 'have', "haven't", 'having', 'he', "he'd",
+    "he'll", "he's", 'her', 'here', "here's", 'hers', 'herself', 'him', 'himself', 'his', 'how', "how's", 'i', "i'd",
+    "i'll", "i'm", "i've", 'if', 'in', 'into', 'is', "isn't", 'it', "it's", 'its', 'itself', 'let', "let's", 'me',
+    'more', 'most', "mustn't", 'my', 'myself', 'no', 'nor', 'not', 'of', 'off', 'on', 'once', 'only', 'or', 'other',
+    'ought', 'our', 'ours', 'ourselves', 'out', 'over', 'own', 'same', 'shan', "shan't", 'she', "she'd", "she'll",
+    "she's", 'should', "shouldn't", 'so', 'some', 'such', 'than', 'that', "that's", 'the', 'their', 'theirs', 'them',
+    'themselves', 'then', 'there', "there's", 'these', 'they', "they'd", "they'll", "they're", "they've", 'this',
+    'those', 'through', 'to', 'too', 'under', 'until', 'up', 'very', 'was', "wasn't", 'we', "we'd", "we'll", "we're",
+    "we've", 'were', "weren't", 'what', "what's", 'when', "when's", 'where', "where's", 'which', 'while', 'who',
+    "who's", 'whom', 'why', "why's", 'with', 'won', "won't", 'would', "wouldn't", 'you', "you'd", "you'll", "you're",
+    "you've", 'your', 'yours', 'yourself', 'yourselves',
+    # Custom words added to ignore based on data review
+    'na', 'yes', 'good', 'fair', 'excellent', 'agree', 'better', 'best', 'company', 'organization', 'work', 'working',
+    'employee', 'phronesis', 'partner', 'team', 'sometimes', 'nothing', 'issue', 'backed', 'left', 'join', 'fill'
+}
+
+# --- Core AI and NLP Helper Functions ---
+
+def _preprocess_text(text: str) -> str:
+    """Cleans and prepares text for NLP analysis."""
+    if not isinstance(text, str): return ""
+    lemmatizer = WordNetLemmatizer()
+    tokens = re.findall(r'\b\w+\b', text.lower())
+    cleaned_tokens = [lemmatizer.lemmatize(word) for word in tokens if word not in STOP_WORDS and len(word) > 2]
+    return " ".join(cleaned_tokens)
+
+def _get_sentiment(text: str, analyzer) -> str:
+    """Analyzes the sentiment of a text string."""
+    if not isinstance(text, str) or not text.strip(): return "Neutral"
+    scores = analyzer.polarity_scores(text)
+    compound_score = scores['compound']
+    if compound_score >= 0.05: return "Positive"
+    elif compound_score <= -0.05: return "Negative"
+    else: return "Neutral"
+
+def _get_human_readable_theme_name(keywords: list, theme_type: str) -> str:
+    """Uses the Gemini LLM to generate a professional name for a theme."""
+    prompt = f"""
+    As an expert HR analyst, provide a concise, professional, and insightful theme name for a set of keywords from employee exit interviews.
+    Theme Type: {theme_type}
+    Keywords: {', '.join(keywords)}
+    Please provide only the theme name, without any extra explanation or quotation marks.
+    """
+    theme_name = ai_services.generate_narrative(prompt)
+    return theme_name.strip().replace('"', '').replace("Theme Name:", "").strip()
+
+def _extract_specialized_themes(corpus: pd.Series, theme_type: str, num_topics: int = 4, num_words: int = 5) -> tuple:
+    """
+    Performs Topic Modeling and then calls the AI interpreter to name the themes.
+    Returns the interpreted themes, the trained LDA model, and the vectorizer.
+    """
+    if corpus.empty or len(corpus) < num_topics: return [], None, None
+    vectorizer = TfidfVectorizer(max_df=0.9, min_df=2, ngram_range=(1, 2), stop_words=list(STOP_WORDS))
+    tfidf_matrix = vectorizer.fit_transform(corpus)
+    if tfidf_matrix.shape[1] < num_topics: return [], None, None
+
+    lda = LatentDirichletAllocation(n_components=num_topics, random_state=42)
+    lda.fit(tfidf_matrix)
+
+    interpreted_themes = []
+    feature_names = vectorizer.get_feature_names_out()
+    for topic_idx, topic in enumerate(lda.components_):
+        keywords = [feature_names[i].replace(' ', '_') for i in topic.argsort()[:-num_words - 1:-1]]
+        theme_name = _get_human_readable_theme_name(keywords, theme_type)
+        interpreted_themes.append({"name": theme_name, "keywords": keywords})
+    return interpreted_themes, lda, vectorizer
+
+# --- Main Orchestration Function ---
+
+def generate_exit_insights(df: pd.DataFrame) -> dict:
+    """
+    This is the main function that orchestrates the entire analysis pipeline,
+    including multi-theme tagging for the interactive drill-down.
+    """
+    if df.empty: return {"praise_themes": [], "concern_themes": [], "employee_data": []}
+
+    logger.info("Starting advanced insight generation...")
+
+    # 1. Preprocessing and Sentiment Analysis
+    df['full_feedback'] = df[[col for col in df.columns if df[col].dtype == 'object']].fillna('').agg(' '.join, axis=1)
+    df['cleaned_feedback'] = df['full_feedback'].apply(_preprocess_text)
+    sentiment_analyzer = SentimentIntensityAnalyzer()
+    df['sentiment'] = df['full_feedback'].apply(lambda text: _get_sentiment(text, sentiment_analyzer))
+
+    # 2. Split data by intent for specialized modeling
+    positive_corpus = df[df['sentiment'] == 'Positive']['cleaned_feedback'].dropna()
+    negative_corpus = df[df['sentiment'] == 'Negative']['cleaned_feedback'].dropna()
+
+    # 3. Run the specialized theme discovery and interpretation engines
+    praise_themes, praise_lda, praise_vec = _extract_specialized_themes(positive_corpus, "Praise / Satisfaction")
+    concern_themes, concern_lda, concern_vec = _extract_specialized_themes(negative_corpus, "Concern / Attrition Driver")
+
+    # 4. THE DRILL-DOWN ENGINE: Assign all relevant themes to each employee
+    df['assigned_themes'] = [[] for _ in range(len(df))]
+
+    # Assign Praise Themes based on probability scores
+    if praise_themes and praise_lda:
+        probs = praise_lda.transform(praise_vec.transform(positive_corpus))
+        for i, doc_idx in enumerate(positive_corpus.index):
+            # Assign any theme with > 20% probability to enable multi-theme discovery
+            assigned = [praise_themes[topic_idx]['name'] for topic_idx, prob in enumerate(probs[i]) if prob > 0.2]
+            df.at[doc_idx, 'assigned_themes'].extend(assigned)
+
+    # Assign Concern Themes based on probability scores
+    if concern_themes and concern_lda:
+        probs = concern_lda.transform(concern_vec.transform(negative_corpus))
+        for i, doc_idx in enumerate(negative_corpus.index):
+            assigned = [concern_themes[topic_idx]['name'] for topic_idx, prob in enumerate(probs[i]) if prob > 0.2]
+            df.at[doc_idx, 'assigned_themes'].extend(assigned)
+
+    # 5. Prepare the final, clean output for the application
+    output_df = df.drop(columns=['full_feedback', 'cleaned_feedback'])
+    results = {
+        "praise_themes": praise_themes,
+        "concern_themes": concern_themes,
+        "employee_data": output_df.to_dict(orient='records')
+    }
+
+    logger.info("Successfully generated AI-interpreted, multi-tagged insights.")
+    return results
+--- END ---
+
+--- File: exit_analysis/router.py ---
+# components/exit_analysis/router.py
+
+from fastapi import APIRouter, UploadFile, File, HTTPException
+import pandas as pd
+
+# Import our custom modules for this component
+from . import analyzer
+from . import logic
+from . import schemas
+
+# Create a router for this component
+router = APIRouter(
+    prefix="/analyze/exit",
+    tags=["Exit Analysis"]
+)
+
+@router.post("/", response_model=schemas.ExitAnalysisResponse)
+async def analyze_exit_data_endpoint(file: UploadFile = File(...)):
+    """
+    Analyzes the uploaded employee exit survey file.
+    
+    This endpoint orchestrates the full pipeline:
+    1. Reads and cleans the raw data using the analyzer.
+    2. Generates sentiment and themes using the logic module.
+    3. Structures the final output according to the Pydantic schemas.
+    """
+    file_contents = await file.read()
+    
+    # Step 1: Call the analyzer to process the raw file into a clean DataFrame.
+    processed_df = analyzer.process_exit_data(file_contents)
+    
+    if processed_df.empty:
+        raise HTTPException(status_code=400, detail="Failed to process the uploaded file. It might be empty or in an incorrect format.")
+
+    # Step 2: Call the logic module to generate AI-powered insights.
+    analysis_results = logic.generate_exit_insights(processed_df)
+
+    # Step 3: Transform the results to match our defined response schema.
+    # This ensures our API response is always consistent.
+    
+    # Transform the themes dictionary into a list of Theme objects
+    themes_list = [
+        schemas.Theme(theme_name=name, keywords=words)
+        for name, words in analysis_results.get("themes", {}).items()
+    ]
+    
+    # The processed_data is already a list of dictionaries, ready for validation.
+    employee_data_list = analysis_results.get("processed_data", [])
+
+    # Step 4: Return the final, structured response.
+    # FastAPI will automatically validate this against ExitAnalysisResponse.
+    return schemas.ExitAnalysisResponse(
+        themes=themes_list,
+        employee_data=employee_data_list
+    )
+--- END ---
+
+--- File: exit_analysis/schemas.py ---
+# components/exit_analysis/schemas.py
+
+from pydantic import BaseModel, Extra
+from typing import List, Dict, Any
+
+# --- Pydantic Models for API Data Structure ---
+
+class Theme(BaseModel):
+    """Represents a single discovered theme."""
+    theme_name: str
+    keywords: List[str]
+
+class EmployeeExitRecord(BaseModel):
+    """
+    Represents the consolidated data for a single employee.
+    Includes demographics, exit details, and our calculated sentiment.
+    """
+    # Key identifier fields from the raw data
+    dateofjoining: str
+    dob: str
+    gender: str
+    designation: str
+    resignationletterdate: str
+    actualrelievingdate: str
+    separationtype: str
+    resignationreason: str
+    
+    # Insights we generated
+    sentiment: str
+
+    # Allow any other columns that came from the pivot (i.e., the questions)
+    class Config:
+        extra = 'allow'
+
+
+class ExitAnalysisResponse(BaseModel):
+    """The main response model for the entire exit analysis endpoint."""
+    themes: List[Theme]
+    employee_data: List[EmployeeExitRecord]
+--- END ---
+
+--- File: exit_analysis/app/exit_app.py ---
+# components/exit_analysis/app/exit_app.py
+
+import streamlit as st
+import pandas as pd
+import sys
+import os
+import plotly.express as px
+
+# --- Path Setup ---
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+from exit_analysis import analyzer, logic
+
+# --- Page Configuration: Must be the first Streamlit command ---
+st.set_page_config(page_title="HR-Insight | Exit Command Center", page_icon="🚪", layout="wide")
+
+# --- UI/UX Styling ---
+def load_css():
+    """Injects the custom CSS for the full 'Command Center' theme."""
+    st.markdown("""
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@600;700;800&family=Inter:wght@400;500;600&display=swap');
+        :root {
+            --primary-bg: #111111; --secondary-bg: #1E1E1E; --border-color: #333333;
+            --text-color: #EAEAEA; --subtle-text-color: #A0A0A0; --primary-accent: #00A99D;
+            --highlight-accent: #D4AF37; --risk-color: #E57373;
+            --header-font: 'Plus Jakarta Sans', sans-serif; --body-font: 'Inter', sans-serif;
+        }
+        .stApp { background-color: var(--primary-bg); color: var(--text-color); }
+        h1, h2, h3, h4 { font-family: var(--header-font); font-weight: 700; color: var(--text-color); }
+        .stMarkdown, .stDataFrame, .stSelectbox, .stButton>button { font-family: var(--body-font); }
+        
+        /* Interactive Theme Button Styling */
+        .stButton>button {
+            background-color: var(--secondary-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 1rem 1.5rem;
+            text-align: left;
+            transition: all 0.2s ease-in-out;
+            width: 100%;
+        }
+        .stButton>button:hover {
+            border-left: 4px solid var(--highlight-accent);
+            transform: translateY(-3px);
+            background-color: #2a2a2a;
+        }
+        .stButton>button p { /* Target the text inside the button */
+            color: var(--highlight-accent);
+            font-family: var(--header-font);
+            font-size: 1.2rem;
+            font-weight: 700;
+        }
+        /* Style for the "Back" button */
+        .stButton>button.back-button {
+            background-color: var(--secondary-bg);
+            border: 1px solid var(--primary-accent);
+            color: var(--primary-accent);
+        }
+
+        /* Styling for verbatim comment display */
+        .comment-card {
+            border-left: 3px solid var(--subtle-text-color);
+            padding-left: 1rem;
+            margin-bottom: 1.5rem;
+            background-color: var(--secondary-bg);
+            border-radius: 8px;
+            padding: 1rem;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+# --- UI Rendering Functions ---
+
+def render_overview(insights):
+    """Renders the main dashboard view with interactive theme cards."""
+    st.header("Strategic Attrition Summary")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("#### ✅ Top Reasons for Satisfaction (Praise Themes)")
+        praise_themes = insights.get('praise_themes', [])
+        if not praise_themes:
+            st.info("No significant positive themes were identified.")
+        else:
+            for theme in praise_themes:
+                # When a button is clicked, it sets session_state and reruns
+                if st.button(theme['name'], key=f"btn_{theme['name']}", use_container_width=True):
+                    st.session_state.selected_theme = theme['name']
+                    st.rerun()
+
+    with col2:
+        st.markdown("#### 🚩 Top Drivers of Attrition (Concern Themes)")
+        concern_themes = insights.get('concern_themes', [])
+        if not concern_themes:
+            st.info("No significant negative themes were identified.")
+        else:
+            for theme in concern_themes:
+                if st.button(theme['name'], key=f"btn_{theme['name']}", use_container_width=True):
+                    st.session_state.selected_theme = theme['name']
+                    st.rerun()
+
+def render_deep_dive(selected_theme, employee_df):
+    """Renders the detailed drill-down view for a selected theme."""
+    st.header(f"Deep Dive: {selected_theme}")
+    
+    if st.button("⬅️ Back to Overview"):
+        st.session_state.selected_theme = None
+        st.rerun()
+
+    # Filter the DataFrame to find all employees tagged with the selected theme
+    filtered_df = employee_df[employee_df['assigned_themes'].apply(lambda themes: selected_theme in themes)]
+
+    if filtered_df.empty:
+        st.warning("No specific employee records found for this theme.")
+        return
+
+    st.markdown(f"Found **{len(filtered_df)} employees** whose feedback relates to this theme.")
+    st.markdown("---")
+    
+    col1, col2 = st.columns([0.6, 0.4])
+    with col1:
+        st.subheader("Verbatim Comments (The 'Why')")
+        # Heuristically find the free-text question columns
+        text_cols = [c for c in filtered_df.columns if 'what' in c or 'suggestion' in c or 'comment' in c or 'addtional' in c]
+        for _, row in filtered_df.iterrows():
+            # Consolidate all non-empty comments for a clean display
+            all_comments = ". ".join(str(s) for s in row[text_cols] if pd.notna(s) and str(s).strip() and len(str(s)) > 1)
+            if all_comments:
+                st.markdown(f'<div class="comment-card"><i>"{all_comments}"</i></div>', unsafe_allow_html=True)
+    
+    with col2:
+        st.subheader("Demographic Breakdown (The 'Who')")
+        if 'designation' in filtered_df.columns:
+            fig = px.pie(filtered_df, names='designation', title='Breakdown by Designation', hole=0.4)
+            fig.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font=dict(color='var(--text-color)'), legend_title_text='')
+            st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Traceable Data (The 'Proof')")
+    display_cols = ['designation', 'resignationreason', 'sentiment'] + text_cols
+    # Ensure all columns exist before trying to display them
+    final_display_cols = [col for col in display_cols if col in filtered_df.columns]
+    st.dataframe(filtered_df[final_display_cols], use_container_width=True)
+
+# --- Main Application Execution ---
+
+load_css()
+# Initialize session state variables to manage the app's state
+if 'exit_insights' not in st.session_state: st.session_state.exit_insights = None
+if 'file_name' not in st.session_state: st.session_state.file_name = None
+if 'selected_theme' not in st.session_state: st.session_state.selected_theme = None
+
+st.title("🚪 Exit Insight Command Center")
+uploaded_file = st.file_uploader("Upload Exit Form Data", type=['xlsx', 'xls', 'csv', 'txt'], key="exit_data_uploader")
+
+if uploaded_file:
+    # Process only if it's a new file to avoid redundant computation
+    if st.session_state.file_name != uploaded_file.name:
+        st.session_state.selected_theme = None # Reset view on new file upload
+        st.session_state.file_name = uploaded_file.name
+        with st.spinner("Running Advanced AI Analysis... Interpreting themes..."):
+            # Full end-to-end pipeline call
+            insights = logic.generate_exit_insights(analyzer.process_exit_data(uploaded_file.getvalue()))
+            st.session_state.exit_insights = insights
+        st.rerun()
+
+if st.session_state.exit_insights:
+    employee_df = pd.DataFrame(st.session_state.exit_insights['employee_data'])
+    
+    # This is the core logic that decides which view to show
+    if st.session_state.selected_theme is None:
+        render_overview(st.session_state.exit_insights)
+    else:
+        render_deep_dive(st.session_state.selected_theme, employee_df)
+else:
+    st.info("Please upload your exit analysis data file to begin.")
+--- END ---
+
