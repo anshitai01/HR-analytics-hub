@@ -12,4 +12,6 @@ plotly
 scikit-learn  # For ML models like LDA
 nltk          # For NLP text pre-processing
 vaderSentiment
-xlrd       
+xlrd 
+altair>=4.2.0
+vega_datasets
