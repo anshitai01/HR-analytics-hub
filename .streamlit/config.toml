@@ -1,4 +1,5 @@
-
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pathlib import Path
 
 [theme]
 
@@ -11,3 +12,4 @@ backgroundColor="#111111"
 secondaryBackgroundColor="#1E1E1E"
 textColor="#EAEAEA"
 font="sans serif"
+

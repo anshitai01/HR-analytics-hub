@@ -29,13 +29,14 @@ async def analyze_attendance_endpoint(file: UploadFile = File(...)):
     file_contents = await file.read()
     
     # Step 1: Call the core analysis engine.
-    # This correctly unpacks the tuple, getting the aggregated employee data.
-    # The daily data is ignored here with '_' as it is not needed for this API response.
-    aggregated_df, _ = analyzer.analyze_attendance(file_contents)
+    # CHANGE: We now unpack 'daily_df' (the second return value) instead of ignoring it.
+    # This allows us to pass the calendar data to the logic module.
+    aggregated_df, daily_df = analyzer.analyze_attendance(file_contents)
     
     # Step 2: Call the single, authoritative source for all business logic and calculations.
-    # This replaces the old, duplicated _build_response_from_df function.
-    analysis_results = logic.generate_attendance_summary(aggregated_df, "Overall")
+    # CHANGE: We pass 'daily_df' to the function so it can calculate period lengths.
+    # We also unpack the result: 'analysis_results' is the summary dict, '_' is the baseline dict (not needed for API).
+    analysis_results, _ = logic.generate_attendance_summary(aggregated_df, "Overall", daily_df=daily_df)
 
     # Step 3: Pydantic validates the dictionary and returns the final JSON response.
     return AttendanceAnalysisResponse(**analysis_results)

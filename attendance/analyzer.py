@@ -1,19 +1,21 @@
-# components/attendance/analyzer.py
-
 import pandas as pd
 import numpy as np
 import re
 import logging
+import io
 
 # --- Setup logging ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # --- Constants for clarity and maintainability ---
-# W* and H* are now officially classified as Presence codes per HR confirmation.
+# W* and H* are Presence codes, representing work done on a non-working day.
 PRESENCE_CODES = {'P', 'AR', 'W*', 'H*'}
 LEAVE_CODES = {'BL', 'CL', 'CO', 'EL', 'ELec', 'ML', 'PL', 'PRL', 'RH', 'SL'}
-ABSENCE_CODES = {'LWP', 'ABSENT'}
+ABSENCE_CODES = {'LWP', 'ABSENT', 'A'}
+# --- NEW: Define codes that are NOT part of an employee's workable days ---
+# These represent scheduled non-working days where no work was performed.
+SCHEDULED_NON_WORKING_CODES = {'H', 'W'}
 
 # Codes that we want to break down for detailed analysis
 LEAVE_BREAKDOWN_CODES = {'CL', 'SL', 'PRL', 'BL', 'ML', 'RH', 'ELec', 'CO'}
@@ -31,10 +33,10 @@ def analyze_attendance(file_contents: bytes) -> tuple[pd.DataFrame, pd.DataFrame
     logger.info("Starting full attendance analysis pipeline...")
     
     try:
-        raw_df = pd.read_excel(file_contents, sheet_name=0)
+        raw_df = pd.read_excel(io.BytesIO(file_contents), sheet_name=0)
     except Exception as e:
         logger.error(f"Failed to read Excel file. Error: {e}")
-        return pd.DataFrame(), pd.DataFrame()
+        raise ValueError(f"Failed to read data. The provided file might not be a valid Excel (.xlsx/.xls) file or is corrupted. Details: {str(e)}")
 
     long_df = _clean_and_melt_data(raw_df)
     if long_df.empty:
@@ -57,22 +59,14 @@ def _clean_and_melt_data(df: pd.DataFrame) -> pd.DataFrame:
     """
     logger.info("Step 1: Cleaning and melting data...")
 
-    # --- THE DEFINITIVE FIX: Robust Column Name Normalization ---
-
-    # 1. Define the canonical (ideal) column names our application will use internally.
-    #    *** MODIFICATION 1: Added 'Relieving_Date' to the canonical set. ***
     CANONICAL_METADATA_COLS = {
         'Employee ID', 'Employee Name', 'Reporting_Manager', 
         'Email ID', 'OU Name', 'Functional Lead', 'Relieving_Date'
     }
 
-    # 2. Create a helper function to 'normalize' any given column name for matching.
-    #    (lowercase, strip whitespace, replace underscores and multiple spaces)
     def normalize_col(name):
         return re.sub(r'\s+', ' ', str(name).strip().lower().replace('_', ' '))
 
-    # 3. Build a mapping from the actual, messy column names in the file
-    #    to our clean, canonical names.
     rename_map = {}
     normalized_target_map = {normalize_col(name): name for name in CANONICAL_METADATA_COLS}
 
@@ -80,14 +74,15 @@ def _clean_and_melt_data(df: pd.DataFrame) -> pd.DataFrame:
         normalized_col = normalize_col(col)
         if normalized_col in normalized_target_map:
             canonical_name = normalized_target_map[normalized_col]
-            if col != canonical_name: # Only add to map if a rename is needed
+            if col != canonical_name:
                 rename_map[col] = canonical_name
     
     df.rename(columns=rename_map, inplace=True)
     logger.info(f"Standardized column names. Mapped: {rename_map}")
-    # --- END OF FIX ---
 
-    # Now, all subsequent code can safely rely on the canonical names.
+    if 'Employee ID' not in df.columns:
+        raise ValueError("The 'Employee ID' column was not found after standardizing column names. Please ensure the file contains a column representing the employee ID.")
+        
     df.dropna(subset=['Employee ID'], inplace=True)
     df['Employee ID'] = df['Employee ID'].astype(str).str.strip()
 
@@ -101,15 +96,13 @@ def _clean_and_melt_data(df: pd.DataFrame) -> pd.DataFrame:
 
     if not date_columns:
         logger.error("No valid date columns found. Aborting analysis.")
-        return pd.DataFrame()
+        raise ValueError(f"No valid date columns found (e.g., '1-Jan-26'). Found columns: {list(df.columns)[:10]}...")
 
-    # This logic is now a safe fallback: it only runs if a column is TRULY missing from the file.
-    for col in ['OU Name', 'Functional Lead', 'Reporting_Manager', 'Relieving_Date']: # Also check for Relieving_Date
+    for col in ['OU Name', 'Functional Lead', 'Reporting_Manager', 'Relieving_Date']:
         if col not in df.columns:
-            df[col] = pd.NaT if col == 'Relieving_Date' else 'N/A' # Use NaT for dates, N/A for strings
+            df[col] = pd.NaT if col == 'Relieving_Date' else 'N/A'
             logger.warning(f"CRITICAL: Column '{col}' was not found in the source file at all. Using placeholder.")
 
-    # This fills empty CELLS with appropriate placeholders.
     for col in metadata_cols:
         if col not in df.columns:
             df[col] = pd.NaT if col == 'Relieving_Date' else 'N/A'
@@ -120,10 +113,8 @@ def _clean_and_melt_data(df: pd.DataFrame) -> pd.DataFrame:
     if 'Relieving_Date' in df.columns:
         df['Relieving_Date'] = pd.to_datetime(df['Relieving_Date'], errors='coerce')
 
-
     if df['Employee ID'].duplicated().any():
         logger.warning("Duplicate Employee IDs found. Consolidating rows...")
-        # Ensure grouping columns exist before grouping
         grouping_keys = [key for key in ['Employee ID'] if key in df.columns]
         if grouping_keys:
             df = df.groupby(grouping_keys).first().reset_index()
@@ -139,6 +130,10 @@ def _clean_and_melt_data(df: pd.DataFrame) -> pd.DataFrame:
     long_df['Code'] = long_df['Code'].astype(str).str.strip().str.upper()
     long_df['Date'] = pd.to_datetime(long_df['Date'], format='%d-%b-%y', errors='coerce')
     
+    # --- ADDITION: Exclude non-working days from the main analysis data ---
+    # This ensures they don't interfere with presence, leave, or absence counts.
+    long_df = long_df[~long_df['Code'].isin(SCHEDULED_NON_WORKING_CODES)]
+
     logger.info(f"Successfully melted data into {len(long_df)} employee-day records.")
     return long_df
 
@@ -154,15 +149,13 @@ def _calculate_metrics_from_long_data(df: pd.DataFrame) -> pd.DataFrame:
     df['leave'] = 0.0
     df['lwp'] = 0.0
     df['absent'] = 0.0
-    
-    # New Feature Engineering: Track weekend and holiday work
     df['worked_weekends'] = 0.0
     df['worked_holidays'] = 0.0
     
     for code in LEAVE_BREAKDOWN_CODES:
         df[f'leave_{code.lower()}'] = 0.0
 
-    # --- Vectorized Logic for Split Days (e.g., "CL/SL") ---
+    # Vectorized Logic for Split Days (e.g., "CL/SL")
     is_split = df['Code'].str.contains('/', na=False)
     split_codes = df.loc[is_split, 'Code'].str.split('/', n=1, expand=True)
     
@@ -181,7 +174,7 @@ def _calculate_metrics_from_long_data(df: pd.DataFrame) -> pd.DataFrame:
         for code in LEAVE_BREAKDOWN_CODES:
             df.loc[is_split, f'leave_{code.lower()}'] = (code1.eq(code) * 0.5) + (code2.eq(code) * 0.5)
             
-    # --- Vectorized Logic for Full Days ---
+    # Vectorized Logic for Full Days
     full_day_mask = ~is_split
     code_full = df.loc[full_day_mask, 'Code']
     
@@ -201,36 +194,41 @@ def _aggregate_employee_data(df: pd.DataFrame) -> pd.DataFrame:
     """
     Aggregates the daily metrics to a final, per-employee summary DataFrame.
     """
-    logger.info("Step 3: Aggregating data to employee level...")
+    logger.info("Step 3: Aggregating data and engineering new metrics...")
 
-    # Define grouping columns, ensuring they exist in the dataframe first.
     grouping_cols = [col for col in ['Employee ID', 'Employee Name', 'Reporting_Manager', 'OU Name', 'Functional Lead'] if col in df.columns]
     
-    # Define all numeric columns to be summed up
     agg_cols_to_sum = ['presence', 'leave', 'lwp', 'absent', 'worked_weekends', 'worked_holidays'] + \
                       [f'leave_{code.lower()}' for code in LEAVE_BREAKDOWN_CODES]
 
-    # *** MODIFICATION 2: Use .agg() to specify different operations for different columns. ***
-    # This allows us to SUM the metrics while keeping the FIRST instance of the Relieving_Date.
     agg_dict = {col: 'sum' for col in agg_cols_to_sum}
     if 'Relieving_Date' in df.columns:
         agg_dict['Relieving_Date'] = 'first' 
         
-    # Perform the aggregation using the dictionary
     aggregated_df = df.groupby(grouping_cols, as_index=False).agg(agg_dict)
     
     # --- Engineer Final HR-defined Metrics ---
-    # Actual Absenteeism per HR definition
+    # Existing metrics (unchanged)
     aggregated_df['total_absenteeism'] = aggregated_df['lwp'] + aggregated_df['absent']
-    
-    # Total workable days is the denominator for all our percentages
     aggregated_df['total_workable_days'] = (
         aggregated_df['presence'] + 
         aggregated_df['leave'] + 
         aggregated_df['total_absenteeism']
     )
     
-    # Rename columns for clarity in the final output
+    # --- START OF NEW METRIC ENGINEERING ---
+    # 1. Rename 'total_workable_days' to 'mandays' to align with HR terminology.
+    #    Based on the HR table, Mandays = Present + Leave + LWP, which is our total_workable_days.
+    aggregated_df.rename(columns={'total_workable_days': 'mandays'}, inplace=True)
+
+    # 2. Calculate the new "% Deployment" metric.
+    #    Formula: (Total Presence Days / Mandays) * 100
+    aggregated_df['deployment_percentage'] = (
+        (aggregated_df['presence'] / aggregated_df['mandays']) * 100
+    ).where(aggregated_df['mandays'] > 0, 0).round(2)
+    # --- END OF NEW METRIC ENGINEERING ---
+    
+    # Rename other columns for clarity in the final output
     aggregated_df.rename(columns={
         'presence': 'total_presence',
         'leave': 'total_leave',
