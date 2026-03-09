@@ -108,7 +108,7 @@ def _clean_and_melt_data(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = pd.NaT if col == 'Relieving_Date' else 'N/A'
             
     df[['Employee ID', 'Employee Name', 'Reporting_Manager', 'OU Name', 'Functional Lead', 'Email ID']] = \
-        df[['Employee ID', 'Employee Name', 'Reporting_Manager', 'OU Name', 'Functional Lead', 'Email ID']].fillna('N/A')
+        df[['Employee ID', 'Employee Name', 'Reporting_Manager', 'OU Name', 'Functional Lead', 'Email ID']].fillna('N/A').astype(str)
     
     if 'Relieving_Date' in df.columns:
         df['Relieving_Date'] = pd.to_datetime(df['Relieving_Date'], errors='coerce')
